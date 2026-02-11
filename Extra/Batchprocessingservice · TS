@@ -1,0 +1,202 @@
+import { appConfig } from '../config/app.config';
+import { database, sql } from '../config/database';
+import { logger } from '../config/logger.config';
+import { ChunkResult } from '../types/batch.types';
+
+export class BatchProcessingService {
+  private chunkSize: number;
+
+  constructor() {
+    this.chunkSize = appConfig.batch.chunkSize;
+  }
+
+  /**
+   * Process batch asynchronously (fire and forget)
+   */
+  public async processBatchAsync(
+    batchId: string,
+    username: string,
+  ): Promise<void> {
+    // Don't await - let it run in background
+    this.processBatch(batchId, username).catch((error) => {
+      logger.error(`Background batch processing failed for ${batchId}:`, error);
+    });
+  }
+
+  /**
+   * Process entire batch in chunks
+   */
+  private async processBatch(batchId: string, username: string): Promise<void> {
+    const pool = await database.getPool();
+
+    try {
+      logger.info(`Starting batch processing for ${batchId}`);
+
+      // Update batch status to PROCESSING
+      await pool.request().input('BatchID', sql.UniqueIdentifier, batchId)
+        .query(`
+          UPDATE UploadBatches
+          SET BatchStatus = 'PROCESSING', ProcessingStarted = SYSDATETIME()
+          WHERE BatchID = @BatchID
+        `);
+
+      // Get total valid records count
+      const countResult = await pool
+        .request()
+        .input('BatchID', sql.UniqueIdentifier, batchId).query(`
+          SELECT COUNT(*) as Total
+          FROM LoanProductsStaging
+          WHERE BatchID = @BatchID AND ValidationStatus = 'VALID'
+        `);
+
+      const totalRecords = countResult.recordset[0].Total;
+      const totalChunks = Math.ceil(totalRecords / this.chunkSize);
+
+      logger.info(
+        `Processing ${totalRecords} records in ${totalChunks} chunks for batch ${batchId}`,
+      );
+
+      // Process each chunk
+      for (let chunkNumber = 0; chunkNumber < totalChunks; chunkNumber++) {
+        await this.processChunk(batchId, chunkNumber, username);
+
+        // Update processed records count
+        await this.updateProcessedCount(batchId);
+      }
+
+      // Mark batch as completed
+      await pool.request().input('BatchID', sql.UniqueIdentifier, batchId)
+        .query(`
+          UPDATE UploadBatches
+          SET BatchStatus = 'COMPLETED', ProcessingCompleted = SYSDATETIME()
+          WHERE BatchID = @BatchID
+        `);
+
+      logger.info(`Batch processing completed for ${batchId}`);
+    } catch (error) {
+      logger.error(`Batch processing failed for ${batchId}:`, error);
+
+      // Mark batch as failed
+      await pool.request().input('BatchID', sql.UniqueIdentifier, batchId)
+        .query(`
+          UPDATE UploadBatches
+          SET BatchStatus = 'FAILED'
+          WHERE BatchID = @BatchID
+        `);
+
+      throw error;
+    }
+  }
+
+  /**
+   * Process a single chunk using the stored procedure
+   */
+  private async processChunk(
+    batchId: string,
+    chunkNumber: number,
+    username: string,
+  ): Promise<ChunkResult> {
+    const pool = await database.getPool();
+    const startTime = Date.now();
+
+    try {
+      const request = pool.request();
+      request.input('BatchID', sql.UniqueIdentifier, batchId);
+      request.input('ChunkNumber', sql.Int, chunkNumber);
+      request.input('ChunkSize', sql.Int, this.chunkSize);
+      request.input('Username', sql.NVarChar(100), username);
+
+      // Call stored procedure
+      const result = await request.execute('usp_ProcessChunk');
+
+      const processingTime = Date.now() - startTime;
+      const created =
+        result.recordset.find((r) => r.Action === 'INSERT')?.Count || 0;
+      const updated =
+        result.recordset.find((r) => r.Action === 'UPDATE')?.Count || 0;
+      const skipped = this.chunkSize - created - updated;
+
+      // Log chunk processing
+      await this.logChunkProcessing(
+        batchId,
+        chunkNumber,
+        this.chunkSize,
+        created,
+        updated,
+        skipped,
+        processingTime,
+      );
+
+      logger.info(
+        `Chunk ${chunkNumber} processed: ${created} created, ${updated} updated, ${skipped} skipped`,
+      );
+
+      return { created, updated, skipped, processingTime };
+    } catch (error) {
+      logger.error(`Chunk ${chunkNumber} processing failed:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Log chunk processing details
+   */
+  private async logChunkProcessing(
+    batchId: string,
+    chunkNumber: number,
+    recordsProcessed: number,
+    created: number,
+    updated: number,
+    skipped: number,
+    processingTime: number,
+  ): Promise<void> {
+    const pool = await database.getPool();
+
+    await pool
+      .request()
+      .input('BatchID', sql.UniqueIdentifier, batchId)
+      .input('ChunkNumber', sql.Int, chunkNumber)
+      .input('RecordsProcessed', sql.Int, recordsProcessed)
+      .input('RecordsCreated', sql.Int, created)
+      .input('RecordsUpdated', sql.Int, updated)
+      .input('RecordsSkipped', sql.Int, skipped)
+      .input('ProcessingTime', sql.Int, processingTime).query(`
+        INSERT INTO ProcessingLog (
+          BatchID, 
+          ChunkNumber, 
+          RecordsProcessed, 
+          RecordsCreated, 
+          RecordsUpdated, 
+          RecordsSkipped, 
+          ProcessingTime
+        )
+        VALUES (
+          @BatchID, 
+          @ChunkNumber, 
+          @RecordsProcessed, 
+          @RecordsCreated, 
+          @RecordsUpdated, 
+          @RecordsSkipped, 
+          @ProcessingTime
+        )
+      `);
+  }
+
+  /**
+   * Update processed records count in batch
+   */
+  private async updateProcessedCount(batchId: string): Promise<void> {
+    const pool = await database.getPool();
+
+    await pool.request().input('BatchID', sql.UniqueIdentifier, batchId).query(`
+        UPDATE b
+        SET ProcessedRecords = (
+          SELECT COUNT(*) 
+          FROM LoanProductsStaging 
+          WHERE BatchID = @BatchID AND ValidationStatus = 'PROCESSED'
+        )
+        FROM UploadBatches b
+        WHERE b.BatchID = @BatchID
+      `);
+  }
+}
